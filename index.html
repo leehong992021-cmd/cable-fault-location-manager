@@ -512,6 +512,45 @@ let CABLES = ["66kV XLPE Power Cable (1000mmsq Cu Conductor)",
   "230kV XLPE Power Cable (2000mmsq Cu Conductor)",
   "400kV XLPE Power Cable (2500mmsq Cu Conductor)",
   "20P Telephone Cable","10P Pilot Cable","20C Alarm Cable","10C LV Cable","DTS Cable"];
+// Cable manufacturers. Seeded here so the field works before the Make sheet is added
+// to Reference.xls; once that sheet exists it replaces this list entirely.
+// `category` only groups the dropdown — the stored value is the plain make name, since
+// cableType already says whether it's Power/Tel/DTS.
+let MAKES = [
+  {make:"LS Vina",         category:"Power"},
+  {make:"LS Hongqi",       category:"Power"},
+  {make:"LS Korea",        category:"Power"},
+  {make:"Baosheng",        category:"Power"},
+  {make:"Iljin Korea",     category:"Power"},
+  {make:"Taihan Korea",    category:"Power"},
+  {make:"Taihan Vietnam",  category:"Power"},
+  {make:"Daewon",          category:"Tel"},
+  {make:"LS Hongqi",       category:"Tel"},
+  {make:"Prysmian Turkey", category:"Tel"},
+  {make:"Taihan",          category:"DTS"}
+];
+
+// Where the fault actually turned out to be. Fixed list taken from the SOP's own
+// scenarios — this is the field both of the manager's questions depend on, so it is
+// deliberately not free text.
+const FAULT_LOCATIONS = [
+  "Link box (LB)",
+  "Joint bay — bonding cable",
+  "Joint bay — coffin box",
+  "Pit / pipe head",
+  "Inside pipe (duct)",
+  "Open trench (buried span)",
+  "Cable entry / wall entry",
+  "Sealing end",
+  "GIS",
+  "Tunnel",
+  "Stop-joint / OG board",
+  "Cable gland area (Tel / LV)",
+  "Inner–outer short (no sheath fault)",
+  "Not yet located",
+  "Other"
+];
+
 let refMeta = { source:"bundled", updatedAt:null, fileName:"" }; // where the arrays above came from
 let referenceFileHandle = null;
 
@@ -534,6 +573,8 @@ function parseReferenceWorkbook(wb){
   const projSheet = findSheet(["project","projects"]);
   const teamSheet = findSheet(["team"]);
   const cableSheet = findSheet(["cable","cables"]);
+  // Optional on purpose: workbooks predating the cable-make work must keep loading.
+  const makeSheet = findSheet(["make","makes","cable make","cable makes","manufacturer"]);
   if (!projSheet || !teamSheet || !cableSheet){
     throw new Error("Workbook must have Project, Team, and Cable sheets (found: "+wb.SheetNames.join(", ")+")");
   }
@@ -561,15 +602,33 @@ function parseReferenceWorkbook(wb){
   if (!kCable) throw new Error("Cable sheet needs a 'Cable Type' column");
   const cables = cableRows.map(r=>String(r[kCable]||"").trim()).filter(Boolean);
 
+  // Make sheet: "Make" (required) + optional "Category" used only to group the dropdown.
+  // Returns null — not [] — when the sheet is absent, so the seeded list is kept rather
+  // than the field being silently emptied.
+  let makes = null;
+  if (makeSheet){
+    const makeRows = XLSX.utils.sheet_to_json(makeSheet, {defval:""});
+    const kMake = makeRows.length ? findKey(makeRows[0], ["Make","Cable Make","Manufacturer","Brand"]) : null;
+    if (kMake){
+      const kCat = findKey(makeRows[0], ["Category","Type","Cable Category","Group"]);
+      makes = makeRows
+        .map(r=>({ make:String(r[kMake]||"").trim(),
+                   category:String(kCat?r[kCat]:"" ||"").trim() }))
+        .filter(m=>m.make);
+      if (!makes.length) makes = null;
+    }
+  }
+
   if (!projects.length) throw new Error("No rows found in the Project sheet");
   if (!team.length) throw new Error("No rows found in the Team sheet");
   if (!cables.length) throw new Error("No rows found in the Cable sheet");
-  return { projects, team, cables };
+  return { projects, team, cables, makes };
 }
 async function applyReferenceData(data, meta){
   PROJECTS=data.projects; TEAM=data.team; CABLES=data.cables;
+  if (data.makes && data.makes.length) MAKES=data.makes;   // absent sheet keeps the seeded list
   refMeta=Object.assign({source:"file", updatedAt:Date.now()}, meta);
-  try{ await DB.set("referenceData", {projects:PROJECTS, team:TEAM, cables:CABLES, meta:refMeta}); }catch(_){}
+  try{ await DB.set("referenceData", {projects:PROJECTS, team:TEAM, cables:CABLES, makes:MAKES, meta:refMeta}); }catch(_){}
 }
 async function loadReferenceFromFile(file){
   const buf=await file.arrayBuffer();
@@ -711,18 +770,29 @@ function revDesc(rev, i){
 function blankFault(n){
   return {
     id:uid(), status:"", date:"",
-    cableType:"", phaseWork:"", span:"", linkBox:"",
+    cableType:"", cableMake:"", phaseWork:"", span:"", linkBox:"",
     phaseColor:"", voltage:"", current:"", method:"",
+    // analysis fields — kept numeric/enumerated so they can actually be trended
+    injectV:"", injectI:"", faultLocation:"", readings:[],
     findings:"", narrative:"", siteEntries:[], testEntries:[]
   };
 }
-// Bring older saved faults (single siteMap/testScreen) up to the gallery model
+function blankReading(){ return { id:uid(), place:"", distance:"", mv:"" }; }
+// Bring older saved faults up to the current model: single siteMap/testScreen -> galleries,
+// and the analysis fields added 2026-08-15 (absent on every record saved before then).
 function migrateFault(f){
   if(!Array.isArray(f.siteEntries)) f.siteEntries=[];
   if(!Array.isArray(f.testEntries)) f.testEntries=[];
   if(f.siteMap && f.siteEntries.length===0) f.siteEntries.push({id:uid(),img:f.siteMap,caption:""});
   if(f.testScreen && f.testEntries.length===0) f.testEntries.push({id:uid(),img:f.testScreen,caption:""});
   delete f.siteMap; delete f.testScreen;
+  if(typeof f.cableMake!=="string") f.cableMake="";
+  if(typeof f.faultLocation!=="string") f.faultLocation="";
+  if(typeof f.injectV!=="string") f.injectV=f.injectV==null?"":String(f.injectV);
+  if(typeof f.injectI!=="string") f.injectI=f.injectI==null?"":String(f.injectI);
+  if(!Array.isArray(f.readings)) f.readings=[];
+  f.readings=f.readings.map(r=>({ id:r.id||uid(), place:String(r.place||""),
+    distance:String(r.distance==null?"":r.distance), mv:String(r.mv==null?"":r.mv) }));
   return f;
 }
 
@@ -1231,6 +1301,29 @@ function viewFaultEditor(){
   const phaseWorkOpts=selOpts(PHASE_WORK, f.phaseWork, "— Select phase of work —");
   const cableOpts=selOpts(CABLES, f.cableType, "— Select cable type —");
   const methodOpts=selOpts(METHODS, f.method, "— Select method —");
+  const locOpts=selOpts(FAULT_LOCATIONS, f.faultLocation, "— Select where the fault was found —");
+  // Makes are grouped by category (Power / Tel / DTS). The same make can appear in more
+  // than one category (LS Hongqi does), which is harmless — the stored value is the name.
+  const makeOpts=(()=>{
+    const cur=f.cableMake;
+    let html=`<option value="">— Select cable make —</option>`;
+    if(cur && !MAKES.some(m=>m.make===cur)) html+=`<option selected>${esc(cur)}</option>`;
+    [...new Set(MAKES.map(m=>m.category||"Other"))].forEach(cat=>{
+      const inCat=MAKES.filter(m=>(m.category||"Other")===cat);
+      if(!inCat.length) return;
+      html+=`<optgroup label="${esc(cat)}">`+
+        inCat.map(m=>`<option ${m.make===cur?"selected":""}>${esc(m.make)}</option>`).join("")+
+        `</optgroup>`;
+    });
+    return html;
+  })();
+  const readingRows=(f.readings||[]).map(r=>`
+    <tr>
+      <td><input data-rd="${f.id}" data-rid="${r.id}" data-rfield="place" value="${esc(r.place)}" placeholder="e.g. Pit 3 / pipe head"></td>
+      <td><input data-rd="${f.id}" data-rid="${r.id}" data-rfield="distance" value="${esc(r.distance)}" placeholder="e.g. 120" inputmode="decimal"></td>
+      <td><input data-rd="${f.id}" data-rid="${r.id}" data-rfield="mv" value="${esc(r.mv)}" placeholder="e.g. 20" inputmode="decimal"></td>
+      <td style="width:44px;text-align:center"><button class="btn sm danger no-print" data-delreading="${r.id}" title="Remove this reading">✕</button></td>
+    </tr>`).join("");
   return `
   ${wizardSteps("faults")}
   <button class="backlink no-print" id="backList">← Back to deployments list</button>
@@ -1243,6 +1336,7 @@ function viewFaultEditor(){
     </div>
     <div class="grid two" style="margin-top:14px">
       <label class="fld">Cable Type<select data-fp="${f.id}" data-field="cableType">${cableOpts}</select></label>
+      <label class="fld">Cable Make<select data-fp="${f.id}" data-field="cableMake">${makeOpts}</select></label>
       <label class="fld">Phase of Work<select data-fp="${f.id}" data-field="phaseWork">${phaseWorkOpts}</select></label>
       <label class="fld">Span<input data-fp="${f.id}" data-field="span" value="${esc(f.span)}" placeholder="e.g. 4"></label>
       <label class="fld">Link Box Involved<input data-fp="${f.id}" data-field="linkBox" value="${esc(f.linkBox)}" placeholder="e.g. LB3/4, LB4/5"></label>
@@ -1258,6 +1352,31 @@ function viewFaultEditor(){
       <label class="fld">Findings / Result
         <textarea data-fp="${f.id}" data-field="findings" placeholder="Signal change found at JB3/4, stronger signal near coffin box…">${esc(f.findings)}</textarea>
       </label>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Fault Analysis <span class="sub">— what makes trends possible; fill in once the fault is confirmed</span></h2>
+    <div style="margin-top:4px">
+      <label class="fld">Where the fault was actually found
+        <select data-fp="${f.id}" data-field="faultLocation">${locOpts}</select>
+      </label>
+    </div>
+    <div class="grid two" style="margin-top:14px">
+      <label class="fld">Injection Voltage (kV)<input data-fp="${f.id}" data-field="injectV" value="${esc(f.injectV)}" placeholder="e.g. 0.1" inputmode="decimal"></label>
+      <label class="fld">Injection Current (mA)<input data-fp="${f.id}" data-field="injectI" value="${esc(f.injectI)}" placeholder="e.g. 80" inputmode="decimal"></label>
+    </div>
+    <div style="margin-top:16px">
+      <div style="font-weight:600;margin-bottom:6px">Voltage-drop readings</div>
+      <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
+        One row per probe point — numbers only, so they can be compared across jobs.
+      </div>
+      <div style="overflow-x:auto">
+      <table class="tbl">
+        <thead><tr><th>Where measured</th><th style="width:130px">Distance (m)</th><th style="width:130px">Reading (mV)</th><th style="width:44px"></th></tr></thead>
+        <tbody>${readingRows||`<tr><td colspan="4" style="color:var(--muted)">No readings yet.</td></tr>`}</tbody>
+      </table></div>
+      <div style="margin-top:8px"><button class="btn sm no-print" data-addreading="${f.id}">✚ Add reading</button></div>
     </div>
     <div style="margin-top:14px">
       <label class="fld">Narrative / Site Notes
@@ -1714,12 +1833,23 @@ function viewReport(){
   ].map(([k,v])=>`<tr><td class="k">${k}</td><td>${esc(v||"")}</td></tr>`).join("");
 
   const fpBlocks=state.faults.map((f,i)=>{
+    // Injection settings and the readings table only appear when filled in, so reports
+    // for older records (and ones still in progress) look exactly as they did before.
+    const inject=[f.injectV?f.injectV+" kV":"", f.injectI?f.injectI+" mA":""].filter(Boolean).join("  ·  ");
+    const rdList=(f.readings||[]).filter(r=>r.place||r.distance||r.mv);
+    const rdText=rdList.map(r=>[r.place, r.distance?r.distance+" m":"", r.mv?r.mv+" mV":""]
+      .filter(Boolean).join(" — ")).join("\n");
     const dataRows=[
-      ["Cable Type",f.cableType],["Phase of Work",f.phaseWork],["Span",f.span],
+      ["Cable Type",f.cableType],["Cable Make",f.cableMake],["Phase of Work",f.phaseWork],["Span",f.span],
       ["Link Box Involved",f.linkBox],["Phase / Color",f.phaseColor],
       ["Voltage Reading",f.voltage],["Current Reading",f.current],
+      ["Injection Settings",inject],
+      ["Voltage-drop Readings",rdText],
+      ["Fault Located At",f.faultLocation],
       ["Findings / Result",f.findings],["Method of Location",f.method]
-    ].map(([k,v])=>`<tr><td class="k">${k}</td><td>${esc(v||"")}</td></tr>`).join("");
+    ].filter(([k,v])=>String(v||"").trim()!=="" ||
+        !["Cable Make","Injection Settings","Voltage-drop Readings","Fault Located At"].includes(k))
+     .map(([k,v])=>`<tr><td class="k">${k}</td><td style="white-space:pre-line">${esc(v||"")}</td></tr>`).join("");
     // Each image + its caption (and the section title with the first image) is one
     // "imgunit" that must not split across pages — if it can't fit, it moves whole to the next page.
     const renderSection=(heading,entries,emptyMsg)=>(entries&&entries.length)
@@ -1825,10 +1955,20 @@ function recordItemFrom(name, data, handle, modified){
   const daysToResolve=(resolved && firstDepDate && lastDepDate)
     ? Math.max(0, Math.round((new Date(lastDepDate+"T00:00")-new Date(firstDepDate+"T00:00"))/86400000))
     : null;
+  // Analysis fields: take the last non-empty value across deployments, since make and
+  // confirmed location are usually only filled in on the visit that found the fault.
+  const lastOf=k=>{ for(let i=dep.length-1;i>=0;i--){ const v=dep[i]&&dep[i][k]; if(v) return v; } return ""; };
+  const allReadings=dep.flatMap(d=>(d.readings||[])
+    .filter(r=>r.mv!==""&&r.mv!=null)
+    .map(r=>({place:r.place||"", distance:Number(r.distance), mv:Number(r.mv),
+              injectV:Number(d.injectV), injectI:Number(d.injectI),
+              faultLocation:d.faultLocation||"", cableMake:d.cableMake||"", cableType:d.cableType||""})));
   return { name, handle, route:m.route||"", projectCode,
     contract:m.contract||"", voltage:m.voltage||"", contractor:m.contractor||"",
     deployments:dep.length, span:rep.span||"", phaseColor:rep.phaseColor||"",
     cableType:rep.cableType||"", method:rep.method||"", linkBox:rep.linkBox||"",
+    cableMake:lastOf("cableMake"), faultLocation:lastOf("faultLocation"),
+    injectV:lastOf("injectV"), injectI:lastOf("injectI"), readings:allReadings,
     status:rep.status||"Investigating", resolved, latestDate, daysToResolve, modified };
 }
 
@@ -2059,6 +2199,9 @@ const CHART_DEFS=[
   {id:"chCable", title:"By Cable Type", sub:"Fault count per cable type", wide:false},
   {id:"chContractor", title:"By Main Contractor", sub:"Faults on each contractor's works", wide:false},
   {id:"chTopAreas", title:"Top Fault Areas", sub:"Most fault-prone spans across all projects", wide:false},
+  {id:"chMakeLocation", title:"Cable Make vs Fault Location", sub:"Where each manufacturer's cable actually fails", wide:true},
+  {id:"chFaultLocation", title:"By Fault Location", sub:"Where faults are found, across all records", wide:false},
+  {id:"chMake", title:"By Cable Make", sub:"Fault count per manufacturer", wide:false},
 ];
 const DASH_DEFAULT_VISIBLE=["chStatus","chFaultsByProject","chCustom","chTimeToResolve"];
 function loadDashVisible(){
@@ -2097,6 +2240,8 @@ const CUSTOM_X_FIELDS=[
   {v:"contractor", label:"Main Contractor", fn:it=>it.contractor||"—"},
   {v:"voltage", label:"Voltage Level", fn:it=>it.voltage||"—"},
   {v:"status", label:"Status", fn:it=>it.status||"—"},
+  {v:"cableMake", label:"Cable Make", fn:it=>it.cableMake||"Not recorded"},
+  {v:"faultLocation", label:"Fault Location", fn:it=>it.faultLocation||"Not recorded"},
   {v:"month", label:"Month", fn:it=>it.latestDate?monthLabel(it.latestDate.slice(0,7)):"—"}
 ];
 const CUSTOM_Y_FIELDS=[
@@ -2403,6 +2548,38 @@ function buildDashboardCharts(){
       data:{labels:c.map(e=>e[0]),datasets:[{label:"Faults",data:c.map(e=>e[1]),backgroundColor:"#e9a020",borderRadius:4}]},
       options:baseOpts({plugins:{tooltip:tooltipFromGroups(groups)},indexAxis:"y",scales:{x:{beginAtZero:true,ticks:{precision:0}}}})});
   }
+  // 11) By fault location — where faults actually turn out to be
+  if(dashVisible.has("chFaultLocation")){
+    const items=itemsFor("chFaultLocation").filter(it=>it.faultLocation);
+    const groups=groupItems(items,it=>it.faultLocation);
+    const c=sortedEntries(countBy(items,it=>it.faultLocation),true);
+    mk("chFaultLocation",{type:"bar",
+      data:{labels:c.map(e=>e[0]),datasets:[{label:"Faults",data:c.map(e=>e[1]),backgroundColor:"#1f9d57",borderRadius:4}]},
+      options:baseOpts({plugins:{tooltip:tooltipFromGroups(groups)},indexAxis:"y",scales:{x:{beginAtZero:true,ticks:{precision:0}}}})});
+  }
+  // 12) By cable make
+  if(dashVisible.has("chMake")){
+    const items=itemsFor("chMake").filter(it=>it.cableMake);
+    const groups=groupItems(items,it=>it.cableMake);
+    const c=sortedEntries(countBy(items,it=>it.cableMake),true);
+    mk("chMake",{type:"bar",
+      data:{labels:c.map(e=>e[0]),datasets:[{label:"Faults",data:c.map(e=>e[1]),backgroundColor:"#7a4fb0",borderRadius:4}]},
+      options:baseOpts({plugins:{tooltip:tooltipFromGroups(groups)},scales:{y:{beginAtZero:true,ticks:{precision:0}}}})});
+  }
+  // 13) Cable make x fault location — the manager's "LS Vina always fails at cable
+  //     entry pipes" question, as a stacked bar: one bar per make, split by location.
+  if(dashVisible.has("chMakeLocation")){
+    const items=itemsFor("chMakeLocation").filter(it=>it.cableMake && it.faultLocation);
+    const makes=[...new Set(items.map(it=>it.cableMake))].sort();
+    const locs=[...new Set(items.map(it=>it.faultLocation))].sort();
+    mk("chMakeLocation",{type:"bar",
+      data:{labels:makes, datasets:locs.map((loc,i)=>({
+        label:loc,
+        data:makes.map(mk2=>items.filter(it=>it.cableMake===mk2 && it.faultLocation===loc).length),
+        backgroundColor:DASH_PALETTE[i%DASH_PALETTE.length], borderRadius:3}))},
+      options:baseOpts({plugins:{legend:{display:true,position:"bottom",labels:{boxWidth:12,font:{size:10}}}},
+        scales:{x:{stacked:true},y:{stacked:true,beginAtZero:true,ticks:{precision:0}}}})});
+  }
 }
 
 // Where the records live, shown in the mobile load prompt so people know what to pick.
@@ -2701,6 +2878,26 @@ function bindView(){
       if(f){ f[el.dataset.field]=el.value; markDirty(); }
     });
   });
+  // voltage-drop readings: edit in place (no re-render, so focus/caret survive typing)
+  $("#view").querySelectorAll("[data-rd]").forEach(el=>{
+    el.addEventListener("input",()=>{
+      const f=state.faults.find(x=>x.id===el.dataset.rd);
+      const r=f&&(f.readings||[]).find(x=>x.id===el.dataset.rid);
+      if(r){ r[el.dataset.rfield]=el.value; markDirty(); }
+    });
+  });
+  $("#view").querySelectorAll("[data-addreading]").forEach(b=>b.addEventListener("click",()=>{
+    const f=state.faults.find(x=>x.id===b.dataset.addreading);
+    if(!f) return;
+    if(!Array.isArray(f.readings)) f.readings=[];
+    f.readings.push(blankReading()); markDirty(); render();
+  }));
+  $("#view").querySelectorAll("[data-delreading]").forEach(b=>b.addEventListener("click",()=>{
+    const f=state.faults.find(x=>x.id===ui.editing);
+    if(!f) return;
+    f.readings=(f.readings||[]).filter(r=>r.id!==b.dataset.delreading);
+    markDirty(); render();
+  }));
   // searchable route field (text + datalist) -> autofill project code / contract / contractor / voltage
   // only on an exact match, so free typing isn't disrupted by a re-render mid-keystroke
   const routeSel=$("#view").querySelector("[data-routeselect]");
@@ -3039,6 +3236,7 @@ function saveToFile(){
     const cachedRef=await DB.get("referenceData");
     if(cachedRef && cachedRef.projects && cachedRef.team && cachedRef.cables){
       PROJECTS=cachedRef.projects; TEAM=cachedRef.team; CABLES=cachedRef.cables;
+      if(cachedRef.makes && cachedRef.makes.length) MAKES=cachedRef.makes;
       refMeta=cachedRef.meta||{source:"file",updatedAt:null,fileName:""};
     }
     // restore the linked Reference.xls handle, then try a silent background refresh
